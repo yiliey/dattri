@@ -13,6 +13,7 @@ if TYPE_CHECKING:
 
 
 import torch
+import sys
 from torch.func import vmap
 from tqdm import tqdm
 
@@ -30,6 +31,10 @@ DEFAULT_PROJECTOR_KWARGS = {
     "use_half_precision": False,
 }
 
+def flush_print(*args, **kwargs):
+        print(*args, **kwargs)
+        sys.stdout.flush()
+
 
 class TRAKAttributor(BaseAttributor):
     """TRAK attributor."""
@@ -42,6 +47,7 @@ class TRAKAttributor(BaseAttributor):
         layer_name: Optional[Union[str, List[str]]] = None,
         device: str = "cpu",
         regularization: float = 0.0,
+        batch_mode: bool = False,
     ) -> None:
         """Initialize the TRAK attributor.
 
@@ -75,6 +81,9 @@ class TRAKAttributor(BaseAttributor):
                 Added as `regularization * I`, where `I` is the identity matrix.
                 Default is 0.0.
         """
+
+        self.batch_mode = batch_mode  
+
         self.task = task
         self.norm_scaler = (
             sum(
@@ -91,11 +100,19 @@ class TRAKAttributor(BaseAttributor):
         self.device = device
         self.grad_target_func = self.task.get_grad_target_func(in_dims=(None, 0))
         self.grad_loss_func = self.task.get_grad_loss_func(in_dims=(None, 0))
-        self.correct_probability_func = vmap(
-            correct_probability_func,
-            in_dims=(None, 0),
-            randomness="different",
-        )
+        if self.batch_mode:
+            self.correct_probability_func = correct_probability_func 
+            self.correct_probability_func = vmap(
+                correct_probability_func,               # 输入: (params, ((image, text), index))
+                in_dims=(None, (None, 0)),              # 控制 param 不变，(image, text) batch 化，index 单个提取
+                randomness="different",
+            )
+        else:
+            self.correct_probability_func = vmap(
+                correct_probability_func,
+                in_dims=(None, 0),
+                randomness="different",
+            )
         self.full_train_dataloader = None
         self.regularization = regularization
 
@@ -184,6 +201,7 @@ class TRAKAttributor(BaseAttributor):
         self.inv_XTX_XT_list = inv_XTX_XT_list
         self.Q = running_Q
 
+
     def attribute(  # noqa: PLR0912, PLR0914, PLR0915
         self,
         test_dataloader: torch.utils.data.DataLoader,
@@ -213,7 +231,7 @@ class TRAKAttributor(BaseAttributor):
         _check_shuffle(test_dataloader)
         if train_dataloader is not None:
             _check_shuffle(train_dataloader)
-
+        print("[0] 🚀 开始 attribute() 运行")
         running_xinv_XTX_XT = 0
         running_Q = 0
         running_count = 0
@@ -231,6 +249,7 @@ class TRAKAttributor(BaseAttributor):
                        training loader or cache a training loader."
             raise ValueError(message)
         for ckpt_idx in range(len(self.task.get_checkpoints())):
+            print(f"[1] 正在处理 checkpoint {ckpt_idx}")
             parameters, _ = self.task.get_param(
                 ckpt_idx=ckpt_idx,
                 layer_name=self.layer_name,
@@ -247,8 +266,10 @@ class TRAKAttributor(BaseAttributor):
                     layer_name=self.layer_name,
                     ckpt_idx=ckpt_idx,
                 )
+                print("[2]grad_target_func 和 grad_loss_func 已初始化")
 
             if train_dataloader is not None:
+                print("[3]开始训练集梯度计算")
                 train_projected_grad = []
                 Q = []
                 for train_data in tqdm(
@@ -258,20 +279,32 @@ class TRAKAttributor(BaseAttributor):
                 ):
                     # TODO: reorganize the data pre-grad processing.
                     if isinstance(train_data, (tuple, list)):
-                        train_batch_data = tuple(
-                            data.to(self.device) for data in train_data
-                        )
+                        if self.batch_mode:
+                            (image, text), index = train_data
+                            image = image.to(self.device)
+                            text = text.to(self.device)
+                            index = index.to(self.device)
+                            train_batch_data = ((image, text), index) 
+                            print("No tuple")
+                        else:
+                            train_batch_data = tuple(
+                                data.to(self.device) for data in train_data
+                            )
                     else:
                         train_batch_data = train_data
 
+                    
                     grad_t = self.grad_loss_func(
                         parameters,
                         train_batch_data,
                     )
+                
+                    print(f"[Train] grad_t[0][:5]: {grad_t[0][:5]}")
+                    print(f"[Grad] mean: {grad_t.mean().item():.4e}, std: {grad_t.std().item():.4e}, max: {grad_t.max().item():.4e}")
                     grad_t = torch.nan_to_num(grad_t)
                     grad_t /= self.norm_scaler
                     batch_size = grad_t.shape[0]
-
+                    print(f"[Train] batch_size used for projection: {batch_size}")
                     grad_p = (
                         random_project(
                             grad_t,
@@ -281,6 +314,7 @@ class TRAKAttributor(BaseAttributor):
                         .clone()
                         .detach()
                     )
+                    print(1)
                     train_projected_grad.append(grad_p)
                     Q.append(
                         (
@@ -296,18 +330,30 @@ class TRAKAttributor(BaseAttributor):
                         .clone()
                         .detach(),
                     )
+                    print(2)
                 train_projected_grad = torch.cat(train_projected_grad, dim=0)
+                print(3)
                 Q = torch.cat(Q, dim=0)
-
+                print(4)
+            # print(f"[Train] Final concatenated train_projected_grad shape: {train_projected_grad.shape}")
+        
             test_projected_grad = []
             for test_data in tqdm(
                 test_dataloader,
                 desc="calculating gradient of test set...",
                 leave=False,
             ):
-                # TODO: reorganize the data pre-grad processing.
+                # TODO: reorganize the data pre-grad processing.  
                 if isinstance(test_data, (tuple, list)):
-                    test_batch_data = tuple(data.to(self.device) for data in test_data)
+                    if self.batch_mode:
+                            (image, text), index = test_data
+                            image = image.to(self.device)
+                            text = text.to(self.device)
+                            index = index.to(self.device)
+                            test_batch_data = ((image, text), index) 
+                            print("No tuple")
+                    else:
+                        test_batch_data = tuple(data.to(self.device) for data in test_data)
                 else:
                     test_batch_data = test_data
                 grad_t = self.grad_target_func(parameters, test_batch_data)
@@ -338,6 +384,10 @@ class TRAKAttributor(BaseAttributor):
                     running_xinv_XTX_XT * running_count
                     + test_projected_grad @ self.inv_XTX_XT_list[ckpt_idx]
                 )
+            
+            running_xinv_XTX_XT = running_xinv_XTX_XT.to(self.device)
+            # running_Q = running_Q.to(self.device)
+            print(self.device)
 
             if train_dataloader is not None:
                 running_Q = running_Q * running_count + Q
@@ -345,6 +395,7 @@ class TRAKAttributor(BaseAttributor):
             if train_dataloader is not None:
                 running_Q /= running_count
             running_xinv_XTX_XT /= running_count
+        
         if train_dataloader is not None:
             return (running_xinv_XTX_XT * running_Q.to(self.device).unsqueeze(0)).T
         return (running_xinv_XTX_XT * self.Q.to(self.device).unsqueeze(0)).T
